@@ -15,9 +15,11 @@
 """Tests for Flower command line interface `stop` command."""
 
 
+import json
 from unittest.mock import MagicMock, call, patch
 
 import click
+import grpc
 import pytest
 
 from flwr.common.constant import CliOutputFormat, Status
@@ -27,6 +29,7 @@ from flwr.proto.control_pb2 import (  # pylint: disable=E0611
     StopRunResponse,
 )
 from flwr.proto.run_pb2 import Run, RunStatus  # pylint: disable=E0611
+from flwr.supercore.error import ApiErrorCode
 
 from .stop import _resolve_run_ids, _stop_runs, stop
 
@@ -136,6 +139,35 @@ def test_stop_all_continues_after_failure() -> None:
             _stop_runs(stub, [3, 1], is_json=False, stop_all=True)
 
     assert stop_run.call_args_list == [
-        call(stub=stub, run_id=3, is_json=False),
-        call(stub=stub, run_id=1, is_json=False),
+        call(stub=stub, run_id=3, is_json=False, ignore_finished=True),
+        call(stub=stub, run_id=1, is_json=False, ignore_finished=True),
+    ]
+
+
+def test_stop_all_ignores_run_that_finished_after_selection() -> None:
+    """A concurrently finished run should not make a batch stop fail."""
+
+    class AlreadyFinishedRpcError(grpc.RpcError):  # type: ignore[misc]
+        """Represent an already-finished API error from the Control API."""
+
+        def details(self) -> str:
+            """Return the serialized Flower error."""
+            return json.dumps(
+                {
+                    "code": ApiErrorCode.RUN_ALREADY_FINISHED,
+                    "detail": "Run already finished.",
+                }
+            )
+
+    stub = MagicMock()
+    stub.StopRun.side_effect = [
+        AlreadyFinishedRpcError(),
+        StopRunResponse(success=True),
+    ]
+
+    _stop_runs(stub, [3, 1], is_json=False, stop_all=True)
+
+    assert stub.StopRun.call_args_list == [
+        call(request=StopRunRequest(run_id=3)),
+        call(request=StopRunRequest(run_id=1)),
     ]

@@ -15,9 +15,10 @@
 """Flower command line interface `stop` command."""
 
 
-from typing import Annotated, Literal
+from typing import Annotated, Literal, cast
 
 import click
+import grpc
 import typer
 
 from flwr.cli.config_migration import migrate, warn_if_federation_config_overrides
@@ -31,6 +32,7 @@ from flwr.proto.control_pb2 import (  # pylint: disable=E0611
     StopRunResponse,
 )
 from flwr.proto.control_pb2_grpc import ControlStub
+from flwr.supercore.error import ApiErrorCode, FlowerError
 
 from .utils import (
     cli_output_handler,
@@ -136,7 +138,12 @@ def _stop_runs(
     for run_id in run_ids:
         typer.secho(f"✋ Stopping run ID {run_id}...", fg=typer.colors.GREEN)
         try:
-            _stop_run(stub=stub, run_id=run_id, is_json=is_json and not stop_all)
+            _stop_run(
+                stub=stub,
+                run_id=run_id,
+                is_json=is_json and not stop_all,
+                ignore_finished=stop_all,
+            )
         except click.ClickException as err:
             if not stop_all:
                 raise
@@ -154,7 +161,12 @@ def _stop_runs(
         )
 
 
-def _stop_run(stub: ControlStub, run_id: int, is_json: bool) -> None:
+def _stop_run(
+    stub: ControlStub,
+    run_id: int,
+    is_json: bool,
+    ignore_finished: bool = False,
+) -> None:
     """Stop a run and display the result.
 
     Parameters
@@ -165,9 +177,28 @@ def _stop_run(stub: ControlStub, run_id: int, is_json: bool) -> None:
         The unique identifier of the run to stop.
     is_json : bool
         Whether JSON output format is requested.
+    ignore_finished : bool (default: False)
+        Whether an already-finished run should be treated as successfully stopped.
     """
-    with flwr_cli_grpc_exc_handler():
-        response: StopRunResponse = stub.StopRun(request=StopRunRequest(run_id=run_id))
+
+    def raise_if_already_finished(error: grpc.RpcError) -> None:
+        details = cast(str, error.details())  # pylint: disable=E1101
+        flower_error = FlowerError.from_json(details)
+        if (
+            ignore_finished
+            and flower_error is not None
+            and flower_error.code == ApiErrorCode.RUN_ALREADY_FINISHED
+        ):
+            raise _RunAlreadyFinishedError
+
+    try:
+        with flwr_cli_grpc_exc_handler(custom_handler=raise_if_already_finished):
+            response: StopRunResponse = stub.StopRun(
+                request=StopRunRequest(run_id=run_id)
+            )
+    except _RunAlreadyFinishedError:
+        typer.secho(f"ℹ️ Run {run_id} already finished.", fg=typer.colors.YELLOW)
+        return
     if response.success:
         typer.secho(f"✅ Run {run_id} successfully stopped.", fg=typer.colors.GREEN)
         if is_json:
@@ -179,3 +210,7 @@ def _stop_run(stub: ControlStub, run_id: int, is_json: bool) -> None:
             )
     else:
         raise click.ClickException(f"Run {run_id} couldn't be stopped.")
+
+
+class _RunAlreadyFinishedError(Exception):
+    """Signal that a batch stop target has already finished."""
