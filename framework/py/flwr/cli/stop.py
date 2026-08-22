@@ -88,25 +88,7 @@ def stop(  # pylint: disable=R0914
 
             run_ids = _resolve_run_ids(stub, run_id)
             stop_all = run_id.lower() == "all"
-            for resolved_run_id in run_ids:
-                typer.secho(
-                    f"✋ Stopping run ID {resolved_run_id}...",
-                    fg=typer.colors.GREEN,
-                )
-                _stop_run(
-                    stub=stub,
-                    run_id=resolved_run_id,
-                    is_json=is_json and not stop_all,
-                )
-            if is_json and stop_all:
-                print_json_to_stdout(
-                    {
-                        "success": True,
-                        "run-ids": [
-                            str(resolved_run_id) for resolved_run_id in run_ids
-                        ],
-                    }
-                )
+            _stop_runs(stub, run_ids, is_json, stop_all)
 
         finally:
             if channel:
@@ -144,6 +126,32 @@ def _resolve_run_ids(stub: ControlStub, run_id: str) -> list[int]:
     if selector == "latest":
         return [active_runs[0].run_id]
     return [run.run_id for run in active_runs]
+
+
+def _stop_runs(
+    stub: ControlStub, run_ids: list[int], is_json: bool, stop_all: bool
+) -> None:
+    """Stop resolved run IDs and display the result."""
+    failures = []
+    for run_id in run_ids:
+        typer.secho(f"✋ Stopping run ID {run_id}...", fg=typer.colors.GREEN)
+        try:
+            _stop_run(stub=stub, run_id=run_id, is_json=is_json and not stop_all)
+        except click.ClickException as err:
+            if not stop_all:
+                raise
+            failures.append(f"Run {run_id}: {err.format_message()}")
+
+    if failures:
+        raise click.ClickException("Failed to stop all runs:\n" + "\n".join(failures))
+
+    if is_json and stop_all:
+        print_json_to_stdout(
+            {
+                "success": True,
+                "run-ids": [str(run_id) for run_id in run_ids],
+            }
+        )
 
 
 def _stop_run(stub: ControlStub, run_id: int, is_json: bool) -> None:

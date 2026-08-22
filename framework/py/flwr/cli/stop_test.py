@@ -15,16 +15,20 @@
 """Tests for Flower command line interface `stop` command."""
 
 
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, call, patch
 
 import click
 import pytest
 
-from flwr.common.constant import Status
-from flwr.proto.control_pb2 import ListRunsResponse  # pylint: disable=E0611
+from flwr.common.constant import CliOutputFormat, Status
+from flwr.proto.control_pb2 import (  # pylint: disable=E0611
+    ListRunsResponse,
+    StopRunRequest,
+    StopRunResponse,
+)
 from flwr.proto.run_pb2 import Run, RunStatus  # pylint: disable=E0611
 
-from .stop import _resolve_run_ids
+from .stop import _resolve_run_ids, _stop_runs, stop
 
 
 def _run(run_id: int, status: str, pending_at: str) -> Run:
@@ -89,3 +93,49 @@ def test_resolve_run_ids_rejects_selector_without_active_runs() -> None:
 
     with pytest.raises(click.ClickException, match="No active runs found"):
         _resolve_run_ids(stub, "all")
+
+
+def test_stop_all_calls_each_run_and_prints_one_json_response() -> None:
+    """The all selector should stop each active run and emit one JSON document."""
+    stub = MagicMock()
+    stub.ListRuns.return_value = ListRunsResponse(
+        run_dict={
+            1: _run(1, Status.RUNNING, "2026-08-20T10:00:00+00:00"),
+            3: _run(3, Status.STARTING, "2026-08-20T11:00:00+00:00"),
+        }
+    )
+    stub.StopRun.return_value = StopRunResponse(success=True)
+    channel = MagicMock()
+
+    with (
+        patch("flwr.cli.stop.warn_if_federation_config_overrides"),
+        patch("flwr.cli.stop.migrate"),
+        patch("flwr.cli.stop.read_superlink_connection"),
+        patch("flwr.cli.stop.init_channel_from_connection", return_value=channel),
+        patch("flwr.cli.stop.ControlStub", return_value=stub),
+        patch("flwr.cli.stop.print_json_to_stdout") as print_json,
+    ):
+        stop(MagicMock(args=[]), "all", output_format=CliOutputFormat.JSON)
+
+    assert stub.StopRun.call_args_list == [
+        call(request=StopRunRequest(run_id=3)),
+        call(request=StopRunRequest(run_id=1)),
+    ]
+    print_json.assert_called_once_with({"success": True, "run-ids": ["3", "1"]})
+    channel.close.assert_called_once()
+
+
+def test_stop_all_continues_after_failure() -> None:
+    """A failed stop should not prevent attempts for later runs in the batch."""
+    stub = MagicMock()
+    with patch(
+        "flwr.cli.stop._stop_run",
+        side_effect=[click.ClickException("already finished"), None],
+    ) as stop_run:
+        with pytest.raises(click.ClickException, match="already finished"):
+            _stop_runs(stub, [3, 1], is_json=False, stop_all=True)
+
+    assert stop_run.call_args_list == [
+        call(stub=stub, run_id=3, is_json=False),
+        call(stub=stub, run_id=1, is_json=False),
+    ]
