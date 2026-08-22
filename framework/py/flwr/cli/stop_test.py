@@ -21,6 +21,7 @@ from unittest.mock import MagicMock, call, patch
 import click
 import grpc
 import pytest
+from typer.testing import CliRunner
 
 from flwr.common.constant import CliOutputFormat, Status
 from flwr.proto.control_pb2 import (  # pylint: disable=E0611
@@ -31,7 +32,6 @@ from flwr.proto.control_pb2 import (  # pylint: disable=E0611
 )
 from flwr.proto.run_pb2 import Run, RunStatus  # pylint: disable=E0611
 from flwr.supercore.error import ApiErrorCode
-from typer.testing import CliRunner
 
 from .app import app
 from .stop import _parse_run_id, _resolve_run_ids, _stop_runs, stop
