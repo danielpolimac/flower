@@ -23,8 +23,10 @@ import typer
 from flwr.cli.config_migration import migrate, warn_if_federation_config_overrides
 from flwr.cli.constant import FEDERATION_CONFIG_HELP_MESSAGE
 from flwr.cli.flower_config import read_superlink_connection
-from flwr.common.constant import CliOutputFormat
+from flwr.common.constant import CliOutputFormat, Status
 from flwr.proto.control_pb2 import (  # pylint: disable=E0611
+    ListRunsRequest,
+    ListRunsResponse,
     StopRunRequest,
     StopRunResponse,
 )
@@ -41,8 +43,8 @@ from .utils import (
 def stop(  # pylint: disable=R0914
     ctx: typer.Context,
     run_id: Annotated[  # pylint: disable=unused-argument
-        int,
-        typer.Argument(help="The Flower run ID to stop"),
+        str,
+        typer.Argument(help="The Flower run ID to stop, or 'latest' or 'all'"),
     ],
     superlink: Annotated[
         str | None,
@@ -84,12 +86,64 @@ def stop(  # pylint: disable=R0914
             channel = init_channel_from_connection(superlink_connection)
             stub = ControlStub(channel)  # pylint: disable=unused-variable # noqa: F841
 
-            typer.secho(f"✋ Stopping run ID {run_id}...", fg=typer.colors.GREEN)
-            _stop_run(stub=stub, run_id=run_id, is_json=is_json)
+            run_ids = _resolve_run_ids(stub, run_id)
+            stop_all = run_id.lower() == "all"
+            for resolved_run_id in run_ids:
+                typer.secho(
+                    f"✋ Stopping run ID {resolved_run_id}...",
+                    fg=typer.colors.GREEN,
+                )
+                _stop_run(
+                    stub=stub,
+                    run_id=resolved_run_id,
+                    is_json=is_json and not stop_all,
+                )
+            if is_json and stop_all:
+                print_json_to_stdout(
+                    {
+                        "success": True,
+                        "run-ids": [
+                            str(resolved_run_id) for resolved_run_id in run_ids
+                        ],
+                    }
+                )
 
         finally:
             if channel:
                 channel.close()
+
+
+def _resolve_run_ids(stub: ControlStub, run_id: str) -> list[int]:
+    """Resolve a numeric run ID or a selector to active run IDs."""
+    selector = run_id.lower()
+    if selector not in ("latest", "all"):
+        try:
+            resolved_run_id = int(run_id)
+        except ValueError:
+            raise click.ClickException(
+                "RUN_ID must be an integer, 'latest', or 'all'."
+            ) from None
+        if resolved_run_id < 0:
+            raise click.ClickException("RUN_ID must be a non-negative integer.")
+        return [resolved_run_id]
+
+    with flwr_cli_grpc_exc_handler():
+        response: ListRunsResponse = stub.ListRuns(ListRunsRequest())
+    active_runs = sorted(
+        (
+            run
+            for run in response.run_dict.values()
+            if run.status.status != Status.FINISHED
+        ),
+        key=lambda run: run.pending_at,
+        reverse=True,
+    )
+    if not active_runs:
+        raise click.ClickException("No active runs found.")
+
+    if selector == "latest":
+        return [active_runs[0].run_id]
+    return [run.run_id for run in active_runs]
 
 
 def _stop_run(stub: ControlStub, run_id: int, is_json: bool) -> None:
