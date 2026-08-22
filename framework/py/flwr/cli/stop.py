@@ -41,6 +41,8 @@ from .utils import (
     print_json_to_stdout,
 )
 
+RunSelector = Literal["latest", "all"]
+
 
 def stop(  # pylint: disable=R0914
     ctx: typer.Context,
@@ -75,6 +77,8 @@ def stop(  # pylint: disable=R0914
     SuperLink via the Control API.
     """
     with cli_output_handler(output_format=output_format) as is_json:
+        parsed_run_id = _parse_run_id(run_id)
+
         # Warn `--federation-config` is ignored
         warn_if_federation_config_overrides(federation_config_overrides)
 
@@ -88,28 +92,37 @@ def stop(  # pylint: disable=R0914
             channel = init_channel_from_connection(superlink_connection)
             stub = ControlStub(channel)  # pylint: disable=unused-variable # noqa: F841
 
-            run_ids = _resolve_run_ids(stub, run_id)
-            stop_all = run_id.lower() == "all"
-            _stop_runs(stub, run_ids, is_json, stop_all)
+            run_ids = _resolve_run_ids(stub, parsed_run_id)
+            selector = parsed_run_id if isinstance(parsed_run_id, str) else None
+            _stop_runs(stub, run_ids, is_json, selector)
 
         finally:
             if channel:
                 channel.close()
 
 
-def _resolve_run_ids(stub: ControlStub, run_id: str) -> list[int]:
-    """Resolve a numeric run ID or a selector to active run IDs."""
+def _parse_run_id(run_id: str) -> int | RunSelector:
+    """Parse a numeric run ID or supported selector."""
     selector = run_id.lower()
-    if selector not in ("latest", "all"):
-        try:
-            resolved_run_id = int(run_id)
-        except ValueError:
-            raise click.ClickException(
-                "RUN_ID must be an integer, 'latest', or 'all'."
-            ) from None
-        if resolved_run_id < 0:
-            raise click.ClickException("RUN_ID must be a non-negative integer.")
-        return [resolved_run_id]
+    if selector == "latest":
+        return "latest"
+    if selector == "all":
+        return "all"
+    try:
+        resolved_run_id = int(run_id)
+    except ValueError:
+        raise click.ClickException(
+            "RUN_ID must be an integer, 'latest', or 'all'."
+        ) from None
+    if resolved_run_id < 0:
+        raise click.ClickException("RUN_ID must be a non-negative integer.")
+    return resolved_run_id
+
+
+def _resolve_run_ids(stub: ControlStub, run_id: int | RunSelector) -> list[int]:
+    """Resolve a parsed run ID or selector to active run IDs."""
+    if isinstance(run_id, int):
+        return [run_id]
 
     with flwr_cli_grpc_exc_handler():
         response: ListRunsResponse = stub.ListRuns(ListRunsRequest())
@@ -125,15 +138,19 @@ def _resolve_run_ids(stub: ControlStub, run_id: str) -> list[int]:
     if not active_runs:
         raise click.ClickException("No active runs found.")
 
-    if selector == "latest":
+    if run_id == "latest":
         return [active_runs[0].run_id]
     return [run.run_id for run in active_runs]
 
 
 def _stop_runs(
-    stub: ControlStub, run_ids: list[int], is_json: bool, stop_all: bool
+    stub: ControlStub,
+    run_ids: list[int],
+    is_json: bool,
+    selector: RunSelector | None,
 ) -> None:
     """Stop resolved run IDs and display the result."""
+    stop_all = selector == "all"
     failures = []
     for run_id in run_ids:
         typer.secho(f"✋ Stopping run ID {run_id}...", fg=typer.colors.GREEN)
@@ -142,7 +159,7 @@ def _stop_runs(
                 stub=stub,
                 run_id=run_id,
                 is_json=is_json and not stop_all,
-                ignore_finished=stop_all,
+                ignore_finished=selector is not None,
             )
         except click.ClickException as err:
             if not stop_all:
@@ -197,7 +214,7 @@ def _stop_run(
                 request=StopRunRequest(run_id=run_id)
             )
     except _RunAlreadyFinishedError:
-        typer.secho(f"ℹ️ Run {run_id} already finished.", fg=typer.colors.YELLOW)
+        _print_already_finished(run_id, is_json)
         return
     if response.success:
         typer.secho(f"✅ Run {run_id} successfully stopped.", fg=typer.colors.GREEN)
@@ -208,8 +225,25 @@ def _stop_run(
                     "run-id": f"{run_id}",
                 }
             )
+    elif ignore_finished and _is_run_finished(stub, run_id):
+        _print_already_finished(run_id, is_json)
     else:
         raise click.ClickException(f"Run {run_id} couldn't be stopped.")
+
+
+def _is_run_finished(stub: ControlStub, run_id: int) -> bool:
+    """Check whether a run finished during a stop request."""
+    with flwr_cli_grpc_exc_handler():
+        response: ListRunsResponse = stub.ListRuns(ListRunsRequest(run_id=run_id))
+    run = response.run_dict.get(run_id)
+    return run is not None and run.status.status == Status.FINISHED
+
+
+def _print_already_finished(run_id: int, is_json: bool) -> None:
+    """Display that a run already reached the requested finished state."""
+    typer.secho(f"ℹ️ Run {run_id} already finished.", fg=typer.colors.YELLOW)
+    if is_json:
+        print_json_to_stdout({"success": True, "run-id": f"{run_id}"})
 
 
 class _RunAlreadyFinishedError(Exception):

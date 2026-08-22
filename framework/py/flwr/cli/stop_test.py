@@ -24,14 +24,32 @@ import pytest
 
 from flwr.common.constant import CliOutputFormat, Status
 from flwr.proto.control_pb2 import (  # pylint: disable=E0611
+    ListRunsRequest,
     ListRunsResponse,
     StopRunRequest,
     StopRunResponse,
 )
 from flwr.proto.run_pb2 import Run, RunStatus  # pylint: disable=E0611
 from flwr.supercore.error import ApiErrorCode
+from typer.testing import CliRunner
 
-from .stop import _resolve_run_ids, _stop_runs, stop
+from .app import app
+from .stop import _parse_run_id, _resolve_run_ids, _stop_runs, stop
+
+runner = CliRunner()
+
+
+class _AlreadyFinishedRpcError(grpc.RpcError):  # type: ignore[misc]
+    """Represent an already-finished API error from the Control API."""
+
+    def details(self) -> str:
+        """Return the serialized Flower error."""
+        return json.dumps(
+            {
+                "code": ApiErrorCode.RUN_ALREADY_FINISHED,
+                "detail": "Run already finished.",
+            }
+        )
 
 
 def _run(run_id: int, status: str, pending_at: str) -> Run:
@@ -46,7 +64,7 @@ def test_resolve_run_ids_returns_numeric_id_without_listing_runs() -> None:
     """A numeric run ID should not require a ListRuns request."""
     stub = MagicMock()
 
-    assert _resolve_run_ids(stub, "123") == [123]
+    assert _resolve_run_ids(stub, 123) == [123]
     stub.ListRuns.assert_not_called()
 
 
@@ -79,10 +97,25 @@ def test_resolve_run_ids_returns_all_active_runs_newest_first() -> None:
 
 
 @pytest.mark.parametrize("run_id", ["newest", "-1"])
-def test_resolve_run_ids_rejects_invalid_run_id(run_id: str) -> None:
+def test_parse_run_id_rejects_invalid_run_id(run_id: str) -> None:
     """Unknown selectors and negative run IDs should be rejected clearly."""
     with pytest.raises(click.ClickException):
-        _resolve_run_ids(MagicMock(), run_id)
+        _parse_run_id(run_id)
+
+
+def test_stop_command_rejects_invalid_selector_before_setup() -> None:
+    """Invalid selectors should fail before migration or connection setup."""
+    with (
+        patch("flwr.cli.app.warn_if_flwr_update_available"),
+        patch("flwr.cli.stop.migrate") as migrate,
+        patch("flwr.cli.stop.init_channel_from_connection") as init_channel,
+    ):
+        result = runner.invoke(app, ["stop", "lates"])
+
+    assert result.exit_code == 1
+    assert "RUN_ID must be an integer, 'latest', or 'all'" in result.output
+    migrate.assert_not_called()
+    init_channel.assert_not_called()
 
 
 def test_resolve_run_ids_rejects_selector_without_active_runs() -> None:
@@ -136,7 +169,7 @@ def test_stop_all_continues_after_failure() -> None:
         side_effect=[click.ClickException("already finished"), None],
     ) as stop_run:
         with pytest.raises(click.ClickException, match="already finished"):
-            _stop_runs(stub, [3, 1], is_json=False, stop_all=True)
+            _stop_runs(stub, [3, 1], is_json=False, selector="all")
 
     assert stop_run.call_args_list == [
         call(stub=stub, run_id=3, is_json=False, ignore_finished=True),
@@ -146,28 +179,38 @@ def test_stop_all_continues_after_failure() -> None:
 
 def test_stop_all_ignores_run_that_finished_after_selection() -> None:
     """A concurrently finished run should not make a batch stop fail."""
-
-    class AlreadyFinishedRpcError(grpc.RpcError):  # type: ignore[misc]
-        """Represent an already-finished API error from the Control API."""
-
-        def details(self) -> str:
-            """Return the serialized Flower error."""
-            return json.dumps(
-                {
-                    "code": ApiErrorCode.RUN_ALREADY_FINISHED,
-                    "detail": "Run already finished.",
-                }
-            )
-
     stub = MagicMock()
     stub.StopRun.side_effect = [
-        AlreadyFinishedRpcError(),
+        _AlreadyFinishedRpcError(),
         StopRunResponse(success=True),
     ]
 
-    _stop_runs(stub, [3, 1], is_json=False, stop_all=True)
+    _stop_runs(stub, [3, 1], is_json=False, selector="all")
 
     assert stub.StopRun.call_args_list == [
         call(request=StopRunRequest(run_id=3)),
         call(request=StopRunRequest(run_id=1)),
     ]
+
+
+def test_stop_latest_ignores_run_that_finished_after_selection() -> None:
+    """The latest selector should accept a target finishing before its stop RPC."""
+    stub = MagicMock()
+    stub.StopRun.side_effect = _AlreadyFinishedRpcError()
+
+    _stop_runs(stub, [3], is_json=False, selector="latest")
+
+
+def test_stop_selector_rechecks_unsuccessful_response() -> None:
+    """A false stop response should succeed if the selected run is now finished."""
+    stub = MagicMock()
+    stub.StopRun.return_value = StopRunResponse(success=False)
+    stub.ListRuns.return_value = ListRunsResponse(
+        run_dict={
+            3: _run(3, Status.FINISHED, "2026-08-20T11:00:00+00:00"),
+        }
+    )
+
+    _stop_runs(stub, [3], is_json=False, selector="all")
+
+    stub.ListRuns.assert_called_once_with(ListRunsRequest(run_id=3))
